@@ -1,120 +1,105 @@
-#!/usr/bin/env python3
 import asyncio
-import json
 import logging
-import os
-import re
-import sys
 import requests
 from pyppeteer import launch
-from bs4 import BeautifulSoup
 
-BOT_TOKEN = "8377225686:AAFMPn2JGtctZvBDJNte1LNq6zK26jRtIgA"
-CHAT_ID = "324115796"
-STATE_FILE = "seen.json"
-MAX_MSG_LEN = 3500
+# --- CONFIG ---
+TELEGRAM_BOT_TOKEN = "8377225686:AAFMPn2JGtctZvBDJNte1LNq6zK26jRtIgA"
+TELEGRAM_CHAT_ID = "324115796"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-TARGETS = {
-    "UGC Notices": "https://www.ugc.gov.in/Notices",
-    "UGC Incorporation": "https://www.ugc.gov.in/incorp",
-    "NMC All News": "https://www.nmc.org.in/all-news/",
-    "DCI India": "https://dciindia.gov.in/NewsEvents.aspx",
-    "INC Nursing": "https://indiannursingcouncil.org/NewsEvents",
-    "PCI Circulars": "https://pci.gov.in/news-event",
+sections = {
+    "UGC Notices": "https://www.ugc.gov.in/",
+    "UGC Incorporation": "https://www.ugc.gov.in/page/miscellaneous.aspx",
+    "NMC All News": "https://www.nmc.org.in/",
+    "DCI India": "https://dciindia.gov.in/",
+    "INC Nursing": "https://www.indiannursingcouncil.org/",
+    "PCI Circulars": "https://pci.nic.in/",
     "MCC UG Medical": "https://mcc.nic.in/ug-medical-counselling/",
     "MCC MDS": "https://mcc.nic.in/mds-counselling/",
     "MCC PG": "https://mcc.nic.in/pg-medical-counselling/",
     "NCAHP CircularOrders": "https://ncahp.abdm.gov.in/CircularOrders",
     "NCAHP WhatWeDo": "https://ncahp.abdm.gov.in/WhatWeDo",
-    "DGEHS Circulars": "https://dgehs.delhi.gov.in/circulars-orders",
+    "DGEHS Circulars": "https://dgehs.delhi.gov.in/"
 }
 
-def load_seen():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
+# --- LOGGING ---
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s | %(levelname)s | %(message)s")
 
-def save_seen(seen_set):
-    with open(STATE_FILE, "w") as f:
-        json.dump(list(seen_set), f)
-
-def send_telegram_message(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-    try:
-        resp = requests.post(url, json=payload, timeout=20)
-        if not resp.ok:
-            logging.error(f"Telegram send failed: {resp.text}")
-    except Exception as e:
-        logging.error(f"Telegram send exception: {e}")
-
-async def fetch_with_browser(url):
+# --- HELPERS ---
+async def fetch_links(url):
+    """Scrape links using headless Chromium."""
     browser = await launch(headless=True, args=["--no-sandbox"])
     page = await browser.newPage()
-    await page.goto(url, {"waitUntil": "networkidle2", "timeout": 60000})
-    html = await page.content()
+    try:
+        await page.goto(url, timeout=60000)
+        anchors = await page.querySelectorAllEval("a", "(els => els.map(a => [a.innerText.trim(), a.href]))")
+    except Exception as e:
+        logging.error(f"Error fetching {url}: {e}")
+        anchors = []
     await browser.close()
-    return html
+    return anchors
 
-def extract_links(html, label):
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    for a in soup.find_all("a", href=True):
-        title = re.sub(r"\s+", " ", a.get_text(strip=True))
-        href = a["href"]
-        if not href.lower().startswith("http"):
+def clean_mcc_links(links):
+    """Filter MCC links: remove junk, keep only valid PDFs/notices."""
+    results = []
+    for text, href in links:
+        if not href:
             continue
-        if not title:
+        skip_patterns = ["sitemap", "archive", "contact", "about", "facebook",
+                         "twitter", "linkedin", "gov.in", "mohfw"]
+        if any(p in href.lower() for p in skip_patterns):
             continue
-        out.append((title, href))
-    return out
+        if text.lower() in ["home", "mcc", "ug medical", "pg medical", "super speciality", "mds"]:
+            continue
+        if href.endswith(".pdf") or "mcc.nic.in" in href:
+            results.append((text if text else "Notice", href))
+    return results[:5]  # limit to latest 5
 
+def format_digest(updates):
+    """Format updates as single digest message."""
+    digest = "📰 *Daily Update Report*\n\n"
+    for section, links in updates.items():
+        digest += f"*{section}*\n"
+        if not links:
+            digest += "✅ No new updates today. Will check again tomorrow.\n\n"
+        else:
+            for text, href in links:
+                digest += f"• {text}\n🔗 {href}\n"
+            digest += "\n"
+    return digest
+
+def send_telegram_message(message):
+    """Send message to Telegram with Markdown formatting."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+        if resp.status_code != 200:
+            logging.error(f"Telegram send failed: {resp.text}")
+        else:
+            logging.info("✅ Sent digest to Telegram")
+    except Exception as e:
+        logging.error(f"Telegram error: {e}")
+
+# --- MAIN ---
 async def main():
-    seen = load_seen()
-    digest_parts = []
+    updates = {}
+    for name, url in sections.items():
+        logging.info(f"🔎 Checking: {name}")
+        links = await fetch_links(url)
 
-    for label, url in TARGETS.items():
-        logging.info(f"🔎 Checking: {label}")
-        try:
-            html = await fetch_with_browser(url)
-            items = extract_links(html, label)
+        if "MCC" in name:  # special filter for MCC sites
+            links = clean_mcc_links(links)
 
-            new_items = []
-            for title, link in items:
-                if link not in seen:
-                    new_items.append((title, link))
-                    seen.add(link)
-
-            if new_items:
-                section_text = f"<b>{label}</b>\n"
-                for title, link in new_items:
-                    section_text += f"• {title}\n🔗 {link}\n"
-            else:
-                section_text = f"<b>{label}</b>\nNo new updates today. ✅\n"
-
-            digest_parts.append(section_text)
-
-        except Exception as e:
-            digest_parts.append(f"<b>{label}</b>\n⚠️ Error fetching data: {e}\n")
-
-    save_seen(seen)
-
-    # send section-wise digest
-    for section in digest_parts:
-        while section:
-            chunk = section[:MAX_MSG_LEN]
-            send_telegram_message(chunk)
-            section = section[MAX_MSG_LEN:]
+        updates[name] = links
+    digest = format_digest(updates)
+    send_telegram_message(digest)
 
 if __name__ == "__main__":
-    try:
-        asyncio.get_event_loop().run_until_complete(main())
-    except KeyboardInterrupt:
-        sys.exit(0)
-
+    asyncio.get_event_loop().run_until_complete(main())
