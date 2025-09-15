@@ -1,0 +1,4 @@
+requests
+pyppeteer
+beautifulsoup4
+lxml
